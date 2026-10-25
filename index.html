@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Top Down Shooter - Multiplayer</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/ably@1.2.48/build/ably.min.js"></script>
+</head>
+<body>
+    <div id="game-container">
+        <div id="game"></div>
+        <div id="ui">
+            <div>Players Online: <span id="player-count">0</span></div>
+            <div id="connection-status">Connecting...</div>
+            <div id="message-log"></div>
+        </div>
+    </div>
+    <script src="main.js"></script>
+</body>
+</html>
