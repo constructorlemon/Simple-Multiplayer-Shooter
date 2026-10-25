@@ -31,6 +31,13 @@ class GameScene extends Phaser.Scene {
         this.bulletLifetime = 2000;
         this.minimapPlayerDots = {};
         this.lastHpShown = null;
+        this.bulletCounter = 0;
+        this.remoteBulletsById = {};
+        this.isHost = false;
+        this.hostId = null;
+        this.scores = {};
+        this.lastLeaderboardText = '';
+        this.respawnDelay = 2000;
     }
 
     create() {
@@ -57,6 +64,10 @@ class GameScene extends Phaser.Scene {
         this.createMinimap();
         this.createHealthBar();
         
+        this.playerName = window.PLAYER_NAME || 'Player';
+        this.createLeaderboard();
+        // Host re-broadcasts the board every 5 s so late joiners and new hosts converge
+        this.time.addEvent({ delay: 5000, loop: true, callback: () => { if (this.isHost) this.publishLeaderboard(); } });
         this.connectToAbly();
     }
 
@@ -117,23 +128,34 @@ class GameScene extends Phaser.Scene {
             
             this.channel.subscribe('hit', (message) => {
                 const data = message.data;
-                if (data.targetId === this.clientId && this.localPlayer) {
-                    this.localPlayer.hp -= data.damage;
-                    if (this.localPlayer.hp < 0) this.localPlayer.hp = 0;
-                }
+                // The shooter decided this bullet hit someone: remove it everywhere
+                const spent = this.remoteBulletsById[data.bulletId];
+                if (spent) spent.destroy();
+                if (data.targetId === this.clientId) this.takeDamage(data.damage, data.shooterId);
+            });
+            
+            this.channel.subscribe('kill', (message) => {
+                if (this.isHost) this.processKill(message.data);
+            });
+            
+            this.channel.subscribe('leaderboard', (message) => {
+                if (this.isHost) return; // the host's own copy is the source of truth
+                this.scores = message.data.scores || {};
+                this.renderLeaderboard();
             });
             
             this.channel.presence.subscribe('enter', (member) => {
                 if (member.clientId !== this.clientId) {
                     this.createRemotePlayer(member);
-                    this.logMessage(member.clientId.substr(7, 5) + ' joined');
+                    this.logMessage(this.nameOf(member.clientId) + ' joined');
+                    if (this.isHost) this.publishLeaderboard();
                 }
                 this.updatePlayerCount();
             });
             
             this.channel.presence.subscribe('leave', (member) => {
                 if (this.players[member.clientId]) {
-                    this.logMessage(member.clientId.substr(7, 5) + ' left');
+                    this.logMessage(this.nameOf(member.clientId) + ' left');
                     this.removePlayer(member.clientId);
                 }
                 this.updatePlayerCount();
@@ -171,6 +193,9 @@ class GameScene extends Phaser.Scene {
         player.controls = { up: 'W', down: 'S', left: 'A', right: 'D' };
         player.keys = this.input.keyboard.addKeys(player.controls); // created once
         player.clientId = this.clientId;
+        player.playerName = this.playerName;
+        player.dead = false;
+        this.addNameLabel(player);
         player.fillColor = color;
         player.targetX = x;
         player.targetY = y;
@@ -184,18 +209,6 @@ class GameScene extends Phaser.Scene {
         player.aimRect.setOrigin(0.5, 1);
         
         this.physics.add.collider(player, this.rocksGroup);
-        
-        // Single overlap for all incoming remote bullets
-        this.physics.add.overlap(player, this.remoteBulletGroup, (a, b) => {
-            const bullet = a.shooterId !== undefined ? a : b;
-            if (!bullet.active) return;
-            this.channel.publish('hit', {
-                targetId: this.clientId,
-                damage: 10,
-                shooterId: bullet.shooterId
-            });
-            bullet.destroy();
-        });
         
         player.lastShot = 0;
         player.shootRate = 250;
@@ -212,7 +225,8 @@ class GameScene extends Phaser.Scene {
             y: player.y,
             hp: player.hp,
             color: color,
-            rotation: 0
+            rotation: 0,
+            name: this.playerName
         }, (err) => {
             if (err) { console.error(err); return; }
             this.channel.presence.get((err2, members) => {
@@ -232,6 +246,7 @@ class GameScene extends Phaser.Scene {
         if (this.players[member.clientId]) {
             const p = this.players[member.clientId];
             const data = member.data || {};
+            if (data.name) this.setPlayerName(p, data.name);
             const color = data.color !== undefined ? data.color : p.fillColor;
             if (color !== p.fillColor) {
                 p.fillColor = color;
@@ -264,6 +279,9 @@ class GameScene extends Phaser.Scene {
         player.aimRect.setOrigin(0.5, 1);
         player.aimRect.setRotation((data.rotation || 0) + Math.PI / 2);
         
+        player.playerName = data.name || member.clientId.substr(7, 5);
+        this.addNameLabel(player);
+        this.applyAlive(player);
         this.players[member.clientId] = player;
     }
 
@@ -280,6 +298,7 @@ class GameScene extends Phaser.Scene {
         player.targetX = data.x;
         player.targetY = data.y;
         player.hp = data.hp;
+        this.applyAlive(player);
         player.lastUpdateTime = now;
         
         if (data.color !== undefined && data.color !== player.fillColor) {
@@ -298,6 +317,7 @@ class GameScene extends Phaser.Scene {
             if (this.players[clientId].aimRect) {
                 this.players[clientId].aimRect.destroy();
             }
+            if (this.players[clientId].nameText) this.players[clientId].nameText.destroy();
             this.players[clientId].destroy();
             delete this.players[clientId];
         }
@@ -309,12 +329,143 @@ class GameScene extends Phaser.Scene {
 
     updatePlayerCount() {
         const playerCountEl = document.getElementById('player-count');
-        if (this.channel) {
-            this.channel.presence.get((err, members) => {
-                if (!err) {
-                    playerCountEl.textContent = members.length;
-                }
-            });
+        if (!this.channel) return;
+        this.channel.presence.get((err, members) => {
+            if (err) return;
+            playerCountEl.textContent = members.length;
+            this.electHost(members);
+        });
+    }
+
+    // The oldest presence entry (Ably server timestamp) is the host; clientId breaks ties.
+    // When the host leaves, the next-oldest player takes over automatically.
+    electHost(members) {
+        if (!members.length) return;
+        const sorted = members.slice().sort((a, b) =>
+            (a.timestamp - b.timestamp) || (a.clientId < b.clientId ? -1 : 1));
+        const wasHost = this.isHost;
+        this.hostId = sorted[0].clientId;
+        this.isHost = this.hostId === this.clientId;
+        if (this.isHost && !wasHost) {
+            this.logMessage('You are the host');
+            this.publishLeaderboard();
+        }
+        this.renderLeaderboard();
+    }
+
+    nameOf(clientId) {
+        const p = this.players[clientId];
+        return (p && p.playerName) || clientId.substr(7, 5);
+    }
+
+    addNameLabel(player) {
+        player.nameText = this.add.text(player.x, player.y - 22, player.playerName, {
+            fontSize: '12px',
+            color: '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 3
+        });
+        player.nameText.setOrigin(0.5, 1);
+        player.nameText.setDepth(10);
+    }
+
+    setPlayerName(player, name) {
+        if (player.playerName === name) return;
+        player.playerName = name;
+        if (player.nameText) player.nameText.setText(name);
+        this.renderLeaderboard();
+    }
+
+    // Dead players are drawn faded for everyone (HP 0 is already synced in player-update)
+    applyAlive(player) {
+        const a = player.hp > 0 ? 1 : 0.3;
+        if (player.alpha === a) return;
+        player.setAlpha(a);
+        if (player.aimRect) player.aimRect.setAlpha(a);
+        if (player.nameText) player.nameText.setAlpha(a);
+    }
+
+    // Runs on the victim's client. Reaching 0 HP counts as one kill for the shooter.
+    takeDamage(damage, shooterId) {
+        const p = this.localPlayer;
+        if (!p || p.dead) return;
+        p.hp = Math.max(0, p.hp - damage);
+        if (p.hp > 0) return;
+        p.dead = true;
+        p.body.setVelocity(0);
+        this.applyAlive(p);
+        this.lastUpdateSent = 0; // push HP 0 to everyone on the next frame
+        const kill = { killerId: shooterId, victimId: this.clientId };
+        this.channel.publish('kill', kill);
+        if (this.isHost) this.processKill(kill); // own messages are not echoed back
+        this.time.delayedCall(this.respawnDelay, () => this.respawnLocalPlayer());
+    }
+
+    respawnLocalPlayer() {
+        const p = this.localPlayer;
+        if (!p) return;
+        const x = Phaser.Math.Between(200, this.mapSize - 200);
+        const y = Phaser.Math.Between(200, this.mapSize - 200);
+        p.setPosition(x, y);
+        p.body.reset(x, y);
+        p.hp = p.maxHp;
+        p.dead = false;
+        this.applyAlive(p);
+        this.lastUpdateSent = 0;
+    }
+
+    // --- Host-managed global kill leaderboard ---
+    processKill(data) {
+        const known = this.players[data.killerId];
+        const entry = this.scores[data.killerId] || { name: this.nameOf(data.killerId), kills: 0 };
+        if (known) entry.name = known.playerName;
+        entry.kills += 1;
+        this.scores[data.killerId] = entry;
+        this.publishLeaderboard();
+        this.renderLeaderboard();
+    }
+
+    publishLeaderboard() {
+        const top = Object.entries(this.scores).sort((a, b) => b[1].kills - a[1].kills).slice(0, 20);
+        this.scores = Object.fromEntries(top);
+        if (this.channel) this.channel.publish('leaderboard', { scores: this.scores });
+    }
+
+    createLeaderboard() {
+        this.leaderboardText = this.add.text(790, 10, '', {
+            fontSize: '13px',
+            color: '#ffffff',
+            align: 'right',
+            backgroundColor: 'rgba(0,0,0,0.55)',
+            padding: { x: 8, y: 6 },
+            lineSpacing: 3
+        });
+        this.leaderboardText.setOrigin(1, 0);
+        this.leaderboardText.setScrollFactor(0);
+        this.leaderboardText.setDepth(100);
+    }
+
+    renderLeaderboard() {
+        if (!this.leaderboardText) return;
+        const rows = {};
+        for (const id in this.scores) rows[id] = { name: this.scores[id].name, kills: this.scores[id].kills };
+        for (const id in this.players) {
+            if (!rows[id]) rows[id] = { name: this.players[id].playerName, kills: 0 };
+            else rows[id].name = this.players[id].playerName;
+        }
+        const list = Object.keys(rows)
+            .map((id) => ({ id: id, name: rows[id].name, kills: rows[id].kills }))
+            .sort((a, b) => (b.kills - a.kills) || a.name.localeCompare(b.name))
+            .slice(0, 8);
+        const lines = ['LEADERBOARD'];
+        list.forEach((r, i) => {
+            lines.push((i + 1) + '. ' + (r.id === this.hostId ? '\u2605 ' : '') + r.name +
+                (r.id === this.clientId ? ' (you)' : '') + '  ' + r.kills);
+        });
+        const text = lines.join('\n');
+        if (text !== this.lastLeaderboardText) { // only re-render the text when it changes
+            this.lastLeaderboardText = text;
+            this.leaderboardText.setText(text);
         }
     }
 
@@ -496,10 +647,10 @@ class GameScene extends Phaser.Scene {
         const keys = player.keys;
         
         body.setVelocity(0);
-        if (keys.up.isDown) body.setVelocityY(-player.speed);
-        if (keys.down.isDown) body.setVelocityY(player.speed);
-        if (keys.left.isDown) body.setVelocityX(-player.speed);
-        if (keys.right.isDown) body.setVelocityX(player.speed);
+        if (!player.dead && keys.up.isDown) body.setVelocityY(-player.speed);
+        if (!player.dead && keys.down.isDown) body.setVelocityY(player.speed);
+        if (!player.dead && keys.left.isDown) body.setVelocityX(-player.speed);
+        if (!player.dead && keys.right.isDown) body.setVelocityX(player.speed);
         
         body.velocity.normalize().scale(player.speed);
         
@@ -528,6 +679,11 @@ class GameScene extends Phaser.Scene {
                     p.aimRect.setRotation(p.rotation + Math.PI / 2);
                 }
             }
+        }
+        
+        for (const id in this.players) {
+            const lp = this.players[id];
+            if (lp.nameText) lp.nameText.setPosition(lp.x, lp.y - 22);
         }
         
         const pointer = this.input.activePointer;
@@ -561,7 +717,7 @@ class GameScene extends Phaser.Scene {
             }
         }
         
-        if (pointer.isDown && time - player.lastShot > player.shootRate) {
+        if (!player.dead && pointer.isDown && time - player.lastShot > player.shootRate) {
             this.shootBullet(player, worldPoint);
             player.lastShot = time;
         }
@@ -574,12 +730,14 @@ class GameScene extends Phaser.Scene {
             for (let clientId in this.players) {
                 if (clientId === this.clientId) continue;
                 const targetPlayer = this.players[clientId];
+                if (targetPlayer.hp <= 0) continue; // already dead
                 const dist = Phaser.Math.Distance.Between(bullet.x, bullet.y, targetPlayer.x, targetPlayer.y);
                 if (dist < 18) {
                     this.channel.publish('hit', {
                         targetId: clientId,
                         damage: 10,
-                        shooterId: this.clientId
+                        shooterId: this.clientId,
+                        bulletId: bullet.bulletId
                     });
                     bullet.destroy();
                     break;
@@ -623,10 +781,12 @@ class GameScene extends Phaser.Scene {
         bullet.body.setVelocity(vx, vy); // after group.add (which resets velocity)
         bullet.expireAt = this.time.now + this.bulletLifetime;
         bullet.shooterId = player.clientId;
+        bullet.bulletId = this.clientId + ':' + (this.bulletCounter++);
         
         if (this.channel) {
             this.channel.publish('bullet', {
                 shooterId: this.clientId,
+                bulletId: bullet.bulletId,
                 x: Math.round(bullet.x * 10) / 10,
                 y: Math.round(bullet.y * 10) / 10,
                 vx: vx,
@@ -642,6 +802,9 @@ class GameScene extends Phaser.Scene {
         bullet.body.setVelocity(data.vx, data.vy);
         bullet.expireAt = this.time.now + this.bulletLifetime;
         bullet.shooterId = data.shooterId;
+        bullet.bulletId = data.bulletId;
+        this.remoteBulletsById[data.bulletId] = bullet;
+        bullet.once('destroy', () => { delete this.remoteBulletsById[data.bulletId]; });
     }
 
 }
@@ -662,4 +825,27 @@ const config = {
     scene: [GameScene]
 };
 
-const game = new Phaser.Game(config);
+let gameStarted = false;
+function startGame(name) {
+    if (gameStarted) return;
+    gameStarted = true;
+    window.PLAYER_NAME = name;
+    new Phaser.Game(config);
+}
+
+// Ask for a name before anything connects
+(function setupNameScreen() {
+    const screen = document.getElementById('name-screen');
+    const input = document.getElementById('name-input');
+    const button = document.getElementById('join-btn');
+    function submit() {
+        let name = input.value.replace(/\s+/g, ' ').trim().slice(0, 12);
+        if (!name) name = 'Player' + Math.floor(100 + Math.random() * 900);
+        screen.classList.add('hidden');
+        input.blur();
+        startGame(name);
+    }
+    button.addEventListener('click', submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    input.focus();
+})();
