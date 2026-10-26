@@ -38,6 +38,7 @@ class GameScene extends Phaser.Scene {
         this.scores = {};
         this.lastLeaderboardText = '';
         this.respawnDelay = 2000;
+        this.killFeed = [];
     }
 
     create() {
@@ -135,6 +136,7 @@ class GameScene extends Phaser.Scene {
             });
             
             this.channel.subscribe('kill', (message) => {
+                this.showKillFeed(message.data); // everyone sees who killed who
                 if (this.isHost) this.processKill(message.data);
             });
             
@@ -395,8 +397,14 @@ class GameScene extends Phaser.Scene {
         p.body.setVelocity(0);
         this.applyAlive(p);
         this.lastUpdateSent = 0; // push HP 0 to everyone on the next frame
-        const kill = { killerId: shooterId, victimId: this.clientId };
+        const kill = {
+            killerId: shooterId,
+            killerName: this.nameOf(shooterId),
+            victimId: this.clientId,
+            victimName: this.playerName
+        };
         this.channel.publish('kill', kill);
+        this.showKillFeed(kill); // own messages are not echoed back
         if (this.isHost) this.processKill(kill); // own messages are not echoed back
         this.time.delayedCall(this.respawnDelay, () => this.respawnLocalPlayer());
     }
@@ -412,6 +420,46 @@ class GameScene extends Phaser.Scene {
         p.dead = false;
         this.applyAlive(p);
         this.lastUpdateSent = 0;
+    }
+
+    // Kill notifications: stacked at the top-center, fade after ~4 s, max 4 at once.
+    // Yellow when you are the killer or the victim.
+    showKillFeed(kill) {
+        const killer = kill.killerName || this.nameOf(kill.killerId);
+        const victim = kill.victimName || this.nameOf(kill.victimId);
+        const mine = kill.killerId === this.clientId || kill.victimId === this.clientId;
+        const t = this.add.text(400, 0, killer + ' killed ' + victim, {
+            fontSize: '14px',
+            color: mine ? '#ffff00' : '#ffffff',
+            stroke: '#000000',
+            strokeThickness: 3
+        });
+        t.setOrigin(0.5, 0);
+        t.setScrollFactor(0);
+        t.setDepth(100);
+        this.killFeed.push(t);
+        if (this.killFeed.length > 4) {
+            const oldest = this.killFeed.shift();
+            this.tweens.killTweensOf(oldest);
+            oldest.destroy();
+        }
+        this.layoutKillFeed();
+        this.tweens.add({
+            targets: t,
+            alpha: 0,
+            delay: 3500,
+            duration: 500,
+            onComplete: () => {
+                const i = this.killFeed.indexOf(t);
+                if (i !== -1) this.killFeed.splice(i, 1);
+                t.destroy();
+                this.layoutKillFeed();
+            }
+        });
+    }
+
+    layoutKillFeed() {
+        this.killFeed.forEach((t, i) => t.setY(12 + i * 20));
     }
 
     // --- Host-managed global kill leaderboard ---

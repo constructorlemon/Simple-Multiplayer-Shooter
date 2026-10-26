@@ -79,6 +79,8 @@ There is no game server. Every browser client runs its own simulation and talks 
 ### 4.4 HUD
 - **Health bar** (top-left): green above 60%, yellow 30–60%, red below 30%, with numeric `hp/100` text. Only redrawn when HP changes.
 - **Minimap** (bottom-left, 150×150): rock dots are created once; each player has one persistent dot that is repositioned every frame.
+- **Kill feed** (top-center): "<killer> killed <victim>" for every kill, up to 4 stacked, fading after about 4 seconds. Yellow when you are the killer or the victim.
+- **Leaderboard** (top-right): see section 6b.
 - **DOM status panel** (below canvas): players online, connection status, and a transient 3-second message log ("xxxxx joined/left").
 
 ---
@@ -138,7 +140,7 @@ Each group has a **single collider with the rocks group** (bullets are destroyed
 | Channel event | Sender | Payload | Receiver behavior |
 |---|---|---|---|
 | `player-update` | Each client, on movement/rotation change, plus a 1 s heartbeat | `{ clientId, x, y, hp, rotation }` (x/y rounded to 0.1, rotation to 0.01) | Set interpolation targets, HP, rotation. Creates the remote player if unknown. |
-| `kill` | Victim, when its HP reaches 0 | `{ killerId, victimId }` | The current host adds one kill to `killerId`. Everyone else ignores it. |
+| `kill` | Victim, when its HP reaches 0 | `{ killerId, killerName, victimId, victimName }` | Every client shows a kill notification. The current host also adds one kill to `killerId`. |
 | `leaderboard` | Host only (on every kill, when a player joins, when a new host takes over, and every 5 s) | `{ scores: { <clientId>: { name, kills } } }` (top 20) | Non-host clients replace their local copy and redraw the board. |
 | `bullet` | Shooter, on fire | `{ shooterId, bulletId, x, y, vx, vy }` | Spawn a local copy of the bullet in `remoteBulletGroup`. |
 | `hit` | **Shooter only** | `{ targetId, damage, shooterId, bulletId }` | Every client destroys the bullet with that `bulletId`. If `targetId` is the local player, subtract `damage` from HP (floored at 0). |
